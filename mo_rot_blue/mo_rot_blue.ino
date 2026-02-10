@@ -1,5 +1,9 @@
-//youtube.com/TARUNKUMARDAHAKE
-//facebook.com/TARUNKUMARDAHAKE
+#define REMOTEXY_MODE__SOFTSERIAL
+#include <SoftwareSerial.h>
+#define REMOTEXY_SERIAL_RX 11
+#define REMOTEXY_SERIAL_TX 10
+#define REMOTEXY_SERIAL_SPEED 9600
+#include <RemoteXY.h>
 
 #include <PID_v1.h>
 #include <LMotorController.h>
@@ -10,7 +14,25 @@
 #include "Wire.h"
 #endif
 
-int MIN_ABS_SPEED =  70;
+#pragma pack(push, 1)
+uint8_t RemoteXY_CONF[] =  // 29 bytes
+  { 255, 2, 0, 0, 0, 22, 0, 19, 0, 0, 0, 0, 31, 1, 106, 200, 1, 1, 1, 0,
+    5, 23, 73, 60, 60, 32, 177, 26, 31 };
+
+// структура определяет все переменные и события вашего интерфейса управления
+struct {
+
+  // input variables
+  int8_t joystick_01_x;  // oт -100 до 100
+  int8_t joystick_01_y;  // oт -100 до 100
+
+  // other variable
+  uint8_t connect_flag;  // =1 if wire connected, else =0
+
+} RemoteXY;
+#pragma pack(pop)
+
+int MIN_ABS_SPEED = 70;
 
 MPU6050 mpu;
 
@@ -30,17 +52,33 @@ float ypr[3];         // [yaw, pitch, roll] yaw/pitch/roll container and gravity
 //PID
 double originalSetpoint = 180;
 double setpoint = originalSetpoint;
-double movingAngleOffset = 0.1;
-double input, output;
 
+int MotorAspeed, MotorBspeed;
 unsigned long lastDebounceTime = 0;
 const unsigned long debounceDelay = 1000;
 
+float MOTORSLACK_A = 70;  // Compensate for motor slack range (low PWM values which result in no motor engagement)
+float MOTORSLACK_B = 70;
+#define BALANCE_PID_MIN -255  // Define PID limits to match PWM max in reverse and foward
+#define BALANCE_PID_MAX 255
+
 //adjust these values to fit your own design
-double Kp = 19;
+double Kp = 15;
 double Kd = 0.8;
-double Ki = 40;
+double Ki = 50;
+
+unsigned long last_blue = 0;
+
+#define RKp 50   //Set this first
+#define RKd 4    //Set this secound
+#define RKi 300  //Finally set this
+
+double ysetpoint;
+double yoriginalSetpoint;
+double input, yinput, youtput, output, Buffer[3];
+
 PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
+PID rot(&yinput, &youtput, &ysetpoint, RKp, RKi, RKd, DIRECT);
 
 double motorSpeedFactorLeft = 1;
 double motorSpeedFactorRight = 1;
@@ -60,6 +98,7 @@ void dmpDataReady() {
 
 
 void setup() {
+  RemoteXY_Init();
 // join I2C bus (I2Cdev library doesn't do this automatically)
 #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
   Wire.begin();
@@ -78,7 +117,7 @@ void setup() {
   mpu.setZGyroOffset(-25);
   mpu.setZAccelOffset(9060);  // 1688 factory default for my test chip
 
-  Serial.begin(9600);
+  Serial.begin(115200);
 
   // make sure it worked (returns 0 if so)
   if (devStatus == 0) {
@@ -99,6 +138,15 @@ void setup() {
     pid.SetMode(AUTOMATIC);
     pid.SetSampleTime(10);
     pid.SetOutputLimits(-255, 255);
+
+    rot.SetMode(AUTOMATIC);
+    rot.SetSampleTime(10);
+    rot.SetOutputLimits(-40, 40);
+
+    originalSetpoint = 183;  //consigne
+    yoriginalSetpoint = 180;
+    setpoint = originalSetpoint;
+    ysetpoint = yoriginalSetpoint;
   } else {
     // ERROR!
     // 1 = initial memory load failed
@@ -112,28 +160,57 @@ void setup() {
 
 
 void loop() {
+  getvalues();
+  if (millis() - last_blue >= 200){
+    last_blue = millis();
+    blue();
+  }
+  printval();
+
+  //Serial.println(motorSpeedFactorLeft);
+}
+
+void blue() {
+  RemoteXY_Handler();
+  if (RemoteXY.connect_flag) {
+    //Serial.println(RemoteXY.joystick_01_y);
+    //Serial.print(" ");
+    if (RemoteXY.joystick_01_y > 10){
+      setpoint = 185;
+    } else{
+      setpoint = 182;
+    }
+    //setpoint = (182 + RemoteXY.joystick_01_x / 15);
+  }
+}
+
+void printval() {
+  Serial.print(yinput);
+  Serial.print("\t");
+  Serial.print(youtput);
+  Serial.print("\t");
+  Serial.print("\t");
+  Serial.print(input);
+  Serial.print("\t");
+  Serial.print(output);
+  Serial.print("\t");
+  Serial.print("\t");
+  Serial.print(MotorAspeed);
+  Serial.print("\t");
+  Serial.print(MotorBspeed);
+  Serial.println("\t");
+}
+
+
+void getvalues() {
   // if programming failed, don't try to do anything
+
   if (!dmpReady) return;
 
   // wait for MPU interrupt or extra packet(s) available
   while (!mpuInterrupt && fifoCount < packetSize) {
-    //no mpu data - performing PID calculations and output to motors
-    pid.Compute();
-    Serial.println(output);
-    motorController.move(output, MIN_ABS_SPEED);
-
-    if ((millis() - lastDebounceTime) > debounceDelay) {
-
-      //MIN_ABS_SPEED += 1;
-
-      //Serial.println(MIN_ABS_SPEED);
-
-      lastDebounceTime = millis();
-
-    }
+    new_pid();
   }
-
-  
   // reset interrupt flag and get INT_STATUS byte
   mpuInterrupt = false;
   mpuIntStatus = mpu.getIntStatus();
@@ -159,13 +236,39 @@ void loop() {
     // (this lets us immediately read more without waiting for an interrupt)
     fifoCount -= packetSize;
 
-    mpu.dmpGetQuaternion(&q, fifoBuffer);
-    mpu.dmpGetGravity(&gravity, &q);
-    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-    input = ypr[0] * 180 / M_PI + 180;
-    
+    mpu.dmpGetQuaternion(&q, fifoBuffer);       //get value for q
+    mpu.dmpGetGravity(&gravity, &q);            //get value for gravity
+    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);  //get value for ypr
 
+    input = ypr[1] * 180 / M_PI + 180;
+    yinput = ypr[0] * 180 / M_PI + 180;
   }
+}
 
-  //Serial.println(motorSpeedFactorLeft);
+void new_pid() {
+  //Compute error
+  pid.Compute();
+  rot.Compute();
+  // Convert PID output to motor control
+  MotorAspeed = compensate_slack(youtput, output, 0);
+  MotorBspeed = compensate_slack(youtput, output, 1);
+  motorController.move(MotorAspeed, MotorBspeed, MIN_ABS_SPEED);
+}
+
+double compensate_slack(double yOutput, double Output, bool A) {
+  // Compensate for DC motor non-linear "dead" zone around 0 where small values don't result in movement
+  //yOutput is for left,right control
+  if (A) {
+    if (Output >= 0)
+      Output = Output + MOTORSLACK_A - yOutput;
+    if (Output < 0)
+      Output = Output - MOTORSLACK_A - yOutput;
+  } else {
+    if (Output >= 0)
+      Output = Output + MOTORSLACK_B + yOutput;
+    if (Output < 0)
+      Output = Output - MOTORSLACK_B + yOutput;
+  }
+  Output = constrain(Output, BALANCE_PID_MIN, BALANCE_PID_MAX);
+  return Output;
 }

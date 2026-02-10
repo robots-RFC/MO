@@ -6,18 +6,20 @@
 #include <RemoteXY.h>
 
 #pragma pack(push, 1)  
-uint8_t RemoteXY_CONF[] =   // 66 bytes
-  { 255,3,0,1,0,59,0,19,0,0,0,0,31,1,106,200,1,1,4,0,
-  1,14,37,24,24,0,2,31,0,1,14,88,24,24,0,2,31,0,1,14,
-  144,24,24,0,2,31,0,74,7,8,94,15,12,2,30,37,64,83,116,114,
-  105,110,103,32,49,0 };
-
+uint8_t RemoteXY_CONF[] =   // 29 bytes
+  { 255,2,0,0,0,22,0,19,0,0,0,0,31,1,106,200,1,1,1,0,
+  5,23,73,60,60,32,177,26,31 };
+  
+// структура определяет все переменные и события вашего интерфейса управления 
 struct {
-    uint8_t button_01;
-    uint8_t button_02;
-    uint8_t button_03;
-    uint8_t strings_01;
-    uint8_t connect_flag;
+
+    // input variables
+  int8_t joystick_01_x; // oт -100 до 100
+  int8_t joystick_01_y; // oт -100 до 100
+
+    // other variable
+  uint8_t connect_flag;  // =1 if wire connected, else =0
+
 } RemoteXY;   
 #pragma pack(pop)
 
